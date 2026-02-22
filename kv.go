@@ -16,42 +16,75 @@ type KV struct {
 	Fsync func(int) error
 	fd    int
 	tree  BTree
+	free  FreeList
 	mmap  struct {
 		total  int
 		chunks [][]byte
 	}
 	page struct {
 		flushed uint64
-		temp    [][]byte
+		nappend uint64
+		updates map[uint64][]byte
 	}
 	failed bool
 }
 
-// reads a page of the BTree === BTree.get()
 func (db *KV) pageRead(ptr uint64) []byte {
+	assert(ptr < db.page.flushed+db.page.nappend)
+	if node, ok := db.page.updates[ptr]; ok {
+		return node
+	}
+	return db.pageReadFile(ptr)
+}
+
+// reads a page of the BTree === BTree.get()
+func (db *KV) pageReadFile(ptr uint64) []byte {
 	start := uint64(0)
 	for _, chunk := range db.mmap.chunks {
 		end := start + uint64(len(chunk))/BTREE_PAGE_SIZE
 		if ptr < end {
-			offset := BTREE_PAGE_SIZE * (ptr-start)
-			return chunk[offset : offset:BTREE_PAGE_SIZE]
+			offset := BTREE_PAGE_SIZE * (ptr - start)
+			return chunk[offset:offset:BTREE_PAGE_SIZE]
 		}
 		start = end
 	}
 	panic("bad ptr")
 }
 
+func (db *KV) pageAlloc(node []byte) uint64 {
+	assert(len(node) == BTREE_PAGE_SIZE)
+	if ptr := db.free.PopHead(); ptr != 0 { // try the free list
+		assert(db.page.updates[ptr] == nil)
+		db.page.updates[ptr] = node
+		return ptr
+	}
+	return db.pageAppend(node) // append
+}
+
 // allocates a new page === BTree.new()
 func (db *KV) pageAppend(node []byte) uint64 {
 	assert(len(node) == BTREE_PAGE_SIZE)
-	ptr := db.page.flushed + uint64(len(db.page.temp))
-	db.page.temp = append(db.page.temp, node)
+	ptr := db.page.flushed + db.page.nappend
+	db.page.nappend++
+	assert(db.page.updates[ptr] == nil)
+	db.page.updates[ptr] = node
 	return ptr
+}
+
+func (db *KV) pageWrite(ptr uint64) []byte {
+	assert(ptr < db.page.flushed+db.page.nappend)
+	if node, ok := db.page.updates[ptr]; ok {
+		return node // pending update
+	}
+	node := make([]byte, BTREE_PAGE_SIZE)
+	copy(node, db.pageReadFile(ptr)) // initialized from the file
+	db.page.updates[ptr] = node
+	return node
 }
 
 // opens or creates a file and fsyncs the directory
 func createFileSync(file string) (int, error) {
-	flags = os.O_RDONLY | syscall.O_DIRECTORY
+	flags := os.O_RDONLY | syscall.O_DIRECTORY
 	// 0o644 === read/write for owner, read-only for others
 	dirfd, err := syscall.Open(path.Dir(file), flags, 0o644)
 	if err != nil {
@@ -73,14 +106,19 @@ func createFileSync(file string) (int, error) {
 
 // open or create a DB file
 func (db *KV) Open() error {
-	if db.Fsync == nil { // if fsync hasn't occured Fsync
+	if db.Fsync == nil {
 		db.Fsync = syscall.Fsync
 	}
 	var err error
+	db.page.updates = map[uint64][]byte{}
 	// B+tree callbacks
 	db.tree.get = db.pageRead
-	db.tree.new = db.pageAppend
-	db.tree.del = func(uint64) {}
+	db.tree.new = db.pageAlloc
+	db.tree.del = db.free.PushTail
+	// free list callbacks
+	db.free.get = db.pageRead
+	db.free.new = db.pageAppend
+	db.free.set = db.pageWrite
 	// open or create the DB file
 	if db.fd, err = createFileSync(db.Path); err != nil {
 		return err
@@ -105,21 +143,26 @@ fail:
 	return fmt.Errorf("KV.Open: %w", err)
 }
 
-const DB_SIG = "BuildYourOwnDB06"
+const DB_SIG = "BuildYourOwnDB07"
 
-// the 1st page stores the root pointer and other auxiliary data.
-// | sig | root_ptr | page_used |
-// | 16B |    8B    |     8B    |
 func loadMeta(db *KV, data []byte) {
-	db.tree.root = binary.LittleEndian.Uint64(data[16:])
-	db.page.flushed = binary.LittleEndian.Uint64(data[24:])
+	db.tree.root = binary.LittleEndian.Uint64(data[16:24])
+	db.page.flushed = binary.LittleEndian.Uint64(data[24:32])
+	db.free.headPage = binary.LittleEndian.Uint64(data[32:40])
+	db.free.headSeq = binary.LittleEndian.Uint64(data[40:48])
+	db.free.tailPage = binary.LittleEndian.Uint64(data[48:56])
+	db.free.tailSeq = binary.LittleEndian.Uint64(data[56:64])
 }
 
 func saveMeta(db *KV) []byte {
-	var data [32]byte
+	var data [64]byte
 	copy(data[:16], []byte(DB_SIG))
-	binary.LittleEndian.PutUint64(data[16:], db.tree.root)
-	binary.LittleEndian.PutUint64(data[24:], db.page.flushed)
+	binary.LittleEndian.PutUint64(data[16:24], db.tree.root)
+	binary.LittleEndian.PutUint64(data[24:32], db.page.flushed)
+	binary.LittleEndian.PutUint64(data[32:40], db.free.headPage)
+	binary.LittleEndian.PutUint64(data[40:48], db.free.headSeq)
+	binary.LittleEndian.PutUint64(data[48:56], db.free.tailPage)
+	binary.LittleEndian.PutUint64(data[56:64], db.free.tailSeq)
 	return data[:]
 }
 
@@ -128,18 +171,26 @@ func readRoot(db *KV, fileSize int64) error {
 		return errors.New("file is not a multiple of pages")
 	}
 	if fileSize == 0 { // empty file
-		db.page.flushed = 1 // the meta page is initialized on the 1st write
-		return nil
+		// reserve 2 pages: the meta page and a free list node
+		db.page.flushed = 2
+		// add an initial node to the free list so it's never empty
+		db.free.headPage = 1 // the 2nd page
+		db.free.tailPage = 1
+		return nil // the meta page will be written in the 1st update
 	}
 	// read the page
 	data := db.mmap.chunks[0]
 	loadMeta(db, data)
+	// initialize the free list
+	db.free.SetMaxSeq()
 	// verify the page
 	bad := !bytes.Equal([]byte(DB_SIG), data[:16])
 	// pointers are within range?
 	maxpages := uint64(fileSize / BTREE_PAGE_SIZE)
 	bad = bad || !(0 < db.page.flushed && db.page.flushed <= maxpages)
 	bad = bad || !(0 < db.tree.root && db.tree.root < db.page.flushed)
+	bad = bad || !(0 < db.free.headPage && db.free.headPage < db.page.flushed)
+	bad = bad || !(0 < db.free.tailPage && db.free.tailPage < db.page.flushed)
 	if bad {
 		return errors.New("bad meta page")
 	}
@@ -155,18 +206,27 @@ func updateRoot(db *KV) error {
 	return nil
 }
 
-// extend mmap with new mappings
-func extendMmap(db *KV, size int) error {
-	if size <= db.mmap.total.alloc {
-		return nil
-	} 
-	alloc := max(db.mmap.total, 64<<20) // doubles current address space
-	for db.mmap.total+alloc < size {
-		alloc *= 2 // alloc*2 if still not big enough
+func max(a, b int) int {
+	if a > b {
+		return a
 	}
-	chunk, err := syscall.Mmap(db.fd, int64(db.mmap.total), alloc,
-	syscall.PROT_READ, syscall.MAP_SHARED,)
-	if err ~= nil {
+	return b
+}
+
+// extend the mmap by adding new mappings.
+func extendMmap(db *KV, size int) error {
+	if size <= db.mmap.total {
+		return nil // enough range
+	}
+	alloc := max(db.mmap.total, 64<<20) // double the current address space
+	for db.mmap.total+alloc < size {
+		alloc *= 2 // still not enough?
+	}
+	chunk, err := syscall.Mmap(
+		db.fd, int64(db.mmap.total), alloc,
+		syscall.PROT_READ, syscall.MAP_SHARED, // read-only
+	)
+	if err != nil {
 		return fmt.Errorf("mmap: %w", err)
 	}
 	db.mmap.total += alloc
@@ -174,28 +234,26 @@ func extendMmap(db *KV, size int) error {
 	return nil
 }
 
-/*
-1. Write new nodes
-2. fsync to enforce order between 1 & 3
-3. Update root pointer atomically
-4. fsync for persistence
-*/
 func updateFile(db *KV) error {
+	// 1. Write new nodes.
 	if err := writePages(db); err != nil {
 		return err
 	}
-
-	if err := db.Fsync(db.fd); err := nil {
+	// 2. `fsync` to enforce the order between 1 and 3.
+	if err := db.Fsync(db.fd); err != nil {
 		return err
 	}
-
-	if err := updateRoot(db) err := nil {
+	// 3. Update the root pointer atomically.
+	if err := updateRoot(db); err != nil {
 		return err
 	}
-
-	if err := db.Fsync(db.fd); err := nil {
+	// 4. `fsync` to make everything persistent.
+	if err := db.Fsync(db.fd); err != nil {
 		return err
 	}
+	// prepare the free list for the next update
+	db.free.SetMaxSeq()
+	return nil
 }
 
 func updateOrRevert(db *KV, meta []byte) error {
@@ -219,25 +277,29 @@ func updateOrRevert(db *KV, meta []byte) error {
 		// in-memory states are reverted immediately to allow reads
 		loadMeta(db, meta)
 		// discard temporaries
-		db.page.temp = db.page.temp[:0]
+		db.page.nappend = 0
+		db.page.updates = map[uint64][]byte{}
 	}
 	return err
 }
 
 func writePages(db *KV) error {
 	// extend the mmap if needed
-	size := (int(db.page.flushed) + len(db.page.temp)) * BTREE_PAGE_SIZE
-	if err := extendMmap(db, size); err != nil {
+	size := (db.page.flushed + db.page.nappend) * BTREE_PAGE_SIZE
+	if err := extendMmap(db, int(size)); err != nil {
 		return err
 	}
 	// write data pages to the file
-	offset := int64(db.page.flushed * BTREE_PAGE_SIZE)
-	if _, err := unix.Pwritev(db.fd, db.page.temp, offset); err != nil {
-		return err
+	for ptr, node := range db.page.updates {
+		offset := int64(ptr * BTREE_PAGE_SIZE)
+		if _, err := unix.Pwrite(db.fd, node, offset); err != nil {
+			return err
+		}
 	}
 	// discard in-memory data
-	db.page.flushed += uint64(len(db.page.temp))
-	db.page.temp = db.page.temp[:0]
+	db.page.flushed += db.page.nappend
+	db.page.nappend = 0
+	db.page.updates = map[uint64][]byte{}
 	return nil
 }
 
